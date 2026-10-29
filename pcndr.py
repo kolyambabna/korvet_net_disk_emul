@@ -11,17 +11,25 @@
 #  1.00 базовая версия (C)
 #  1.01 добавлена поддержка диска E и сохранение записываемых файлов на диск (C)
 #  1.01p Python-порт: кроссплатформенность (Linux/Windows), pyserial
+#         + ветки записи в образы KDI: создание (22), приём секторов (21) с
+#         проверкой КС, закрытие (16), удаление (19), переименование (23).
+#         В C-версии эти функции только протоколировались в tempfile.bin.
+#         + -yy N / -posty MS: одиночный байт 'Y' (или 'N') залипает в буфере
+#         драйвера USB-RS232 (latency timer CH340/PL2303 ~16 мс) и не успевает
+#         в таймаут клиента. Несколько байтов подряд драйвер выталкивает сразу.
+#         Ответ монитора уходит до любой печати в консоли.
 #
 
 import argparse
 import sys
+import time
 
 import serial
 
 import common
 from common import abort
 from console import ConsoleKeys
-from kdi import KdiDrive
+from kdi import KdiDrive, KdiError
 from lan import Lan
 
 VERSION = "1.01p"
@@ -49,12 +57,42 @@ def parse_args():
                    help="пропуск фазы загрузки системы")
     p.add_argument("-d", action="store_true",
                    help="отладочная печать сетевого обмена")
+    p.add_argument("-yy", metavar="N", type=int, default=1,
+                   help="сколько байтов подтверждения подряд отправлять (1 как в C); "
+                        "одиночный 'Y' залипает в буфере драйвера USB-RS232, "
+                        "на CH340/PL2303 помогает -yy 2 (по умолчанию %(default)s)")
+    p.add_argument("-posty", metavar="MS", type=float, default=2.0,
+                   help="пауза в миллисекундах после подтверждения, перед ответом "
+                        "и следующим маркером опроса (по умолчанию %(default)s)")
     return p.parse_args()
+
+
+def send_ack(ser, ch, count):
+    """Подтверждение ('Y') или отказ ('N') в линию.
+
+    Драйверы USB-RS232 (CH340, PL2303) держат одиночный байт до latency timer
+    (~16 мс), и клиент не успевает его прочесть; несколько байтов подряд
+    уходят сразу. flush обязателен: без него байт остаётся в буфере Python.
+    """
+    ser.write(ch * count)
+    ser.flush()
 
 
 def fmt_name(raw):
     """Подготовка к печати 11-байтного имени CP/M (аналог %.11s)."""
     return raw.split(b"\x00", 1)[0].decode("ascii", "replace")
+
+
+def sel_drive(drives, drive):
+    """Образ диска по номеру из пакета; None - такого диска нет."""
+    if 0 <= drive < len(drives):
+        return drives[drive]
+    return None
+
+
+def note(text):
+    """Пояснение к операции - с новой строки, не затирая заголовок операции."""
+    print("\n   %s" % text, end="", flush=True)
 
 
 def readfile(ser, drives, drive, raw_name, user):
@@ -112,6 +150,8 @@ def main():
     nodeadr = args.n
     if not 1 <= nodeadr <= 15:
         abort("\n - Адрес РМУ должен быть в диапазоне 1-15\n")
+    if args.yy < 1:
+        abort("\n - Число повторов подтверждения -yy должно быть не меньше 1\n")
 
     print("\n ***  Сетевой монитор КОРВЕТ CP/N-90 версия %s ***" % VERSION)
 
@@ -128,6 +168,13 @@ def main():
 
     ser.reset_input_buffer()
     ser.reset_output_buffer()
+
+    print(" + Подтверждение: %d байт(а), пауза после него %g мс"
+          % (args.yy, args.posty), flush=True)
+    if sys.platform == "win32" and args.yy == 1:
+        # иначе одиночный 'Y' может не дойти до клиента за его таймаут
+        print(" ! Если Корвет не видит ответы: поставьте Latency Timer=1 мс "
+              "для %s или запускайте с -yy 2" % args.s, flush=True)
 
     marker = bytes([0xFF, 0x80 | nodeadr])  # маркер опроса клиента с адресом узла
 
@@ -158,8 +205,9 @@ def main():
     print("\n + Ждем команду от клиента", end="", flush=True)
 
     cr_flag = 0     # флаг перехода на новую строку в логе операций
-    wsector = 0     # счетчик записываемых секторов
-    tempfile = None  # файл для записываемых данных
+    wsector = 0     # счетчик принятых секторов записываемого файла
+    wfile = None    # сессия записи в образ (KdiWriter), None - писать некуда
+    wsum = 0        # нарастающая контрольная сумма принятых данных
 
     try:
         with ConsoleKeys() as keys:
@@ -178,6 +226,7 @@ def main():
 
                 # ============ отправляем маркер опроса в сеть ============
                 ser.write(marker)
+                ser.flush()
                 first = ser.read(1)
                 if not first:
                     continue  # ответа нет
@@ -195,12 +244,17 @@ def main():
                 # ---------- Проверка контрольной суммы пакета ----------
                 csum = sum(pkt[1:33]) & 0xFF
                 if csum != pkt[33]:
-                    # КС неправильная - ответ N
-                    ser.write(b"N")
+                    # КС неправильная - сначала уходит 'N' и только потом печать,
+                    # чтобы консоль не задерживала ответ в линии
+                    send_ack(ser, b"N", args.yy)
                     print("\n - Пакет с неправильной контрольной суммой: %02x != %02x"
                           % (csum, pkt[33]), end="", flush=True)
                     continue
-                ser.write(b"Y")  # КС правильная - подтверждаем пакет
+                send_ack(ser, b"Y", args.yy)  # КС правильная - подтверждаем пакет
+                if args.posty > 0:
+                    # пауза до данных/следующего маркера: клиенту надо успеть
+                    # обработать подтверждение
+                    time.sleep(args.posty / 1000.0)
 
                 # ---------- разбираем данные пакета ----------
                 user = pkt[1] & 0x1F  # # user-области
@@ -225,19 +279,45 @@ def main():
                     cr_flag = 0
                     print("\n + Открытие файла U%i: %c:%s" % (user, dl, disp),
                           end="", flush=True)
+                    drv = sel_drive(drives, drive)
+                    if drv is None:
+                        note("- диск %c не подключен" % dl)
+                    elif drv.locate(raw_name) < 0:
+                        note("- файла на образе нет")
 
                 elif fn == 16:
                     cr_flag = 0
                     print("\n + Закрытие файла U%i: %c:%s" % (user, dl, disp),
                           end="", flush=True)
-                    if tempfile is not None:
-                        tempfile.close()
-                        tempfile = None
+                    if wfile is None:
+                        note("- писать было нечего, образ не изменен")
+                    else:
+                        try:
+                            res = wfile.commit()   # данные и каталог уходят в образ
+                        except KdiError as e:
+                            note("- файл не записан: %s" % e)
+                        else:
+                            note("+ записано %d секторов (%d байт), блоков %d, "
+                                 "свободно ещё %d"
+                                 % (res["records"], res["records"] * 128,
+                                    len(res["blocks"]),
+                                    len(wfile.drv.free_blocks())))
+                        wfile = None
+                        wsum = 0
 
                 elif fn == 19:
                     cr_flag = 0
                     print("\n + Удаление файла U%i: %c:%s" % (user, dl, disp),
                           end="", flush=True)
+                    drv = sel_drive(drives, drive)
+                    try:
+                        if drv is None:
+                            raise KdiError("диск %c не подключен" % dl)
+                        n = drv.delete(raw_name)
+                    except KdiError as e:
+                        note("- %s" % e)
+                    else:
+                        note("+ помечено входов каталога: %d" % n)
 
                 elif fn == 20:
                     # Последовательное чтение всего файла
@@ -245,7 +325,7 @@ def main():
                     readfile(ser, drives, drive, raw_name, user)
 
                 elif fn == 21:
-                    # Последовательная запись файла
+                    # Последовательная запись файла: один 128-байтовый сектор + КС
                     ser.timeout = None  # ждем без таймаута весь блок из 129 байт
                     if cr_flag != 2:
                         print("\n", end="")
@@ -253,25 +333,64 @@ def main():
                         wsector = 0
                     print("\r + Запись файла U%i: %c:%s  блок # %i"
                           % (user, dl, disp, wsector), end="", flush=True)
-                    wsector += 1
                     block = ser.read(129)  # принимаем блок
-                    ser.write(b"Y")        # ответ клиенту
-                    if tempfile is not None:
-                        tempfile.write(block[:128])
+                    if len(block) < 129:
+                        send_ack(ser, b"N", args.yy)
+                        note("- принято %d байт вместо 129, запись прервана"
+                             % len(block))
+                        wfile = None
+                    elif wfile is None:
+                        # файл не создавался - принимать некуда
+                        send_ack(ser, b"N", args.yy)
+                        note("- файл не создавался, блок отклонен")
+                    else:
+                        # КС - нарастающая сумма байт файла, как при его чтении
+                        want = (wsum + sum(block[:128])) & 0xFF
+                        if want != block[128]:
+                            send_ack(ser, b"N", args.yy)
+                            note("- КС блока %02X != %02X, блок отброшен"
+                                 % (block[128], want))
+                        else:
+                            # блок принят; при откате КС не накручиваем, чтобы
+                            # повтор того же блока прошёл проверкой
+                            wsum = want
+                            wfile.add(block[:128])
+                            wsector += 1
+                            send_ack(ser, b"Y", args.yy)  # ответ клиенту
 
                 elif fn == 22:
                     cr_flag = 0
                     print("\n + Создание файла U%i: %c:%s" % (user, dl, disp),
                           end="", flush=True)
-                    if tempfile is not None:
-                        tempfile.close()
-                    tempfile = open("tempfile.bin", "wb")
+                    wfile = None
+                    wsum = 0
+                    wsector = 0
+                    drv = sel_drive(drives, drive)
+                    try:
+                        if drv is None:
+                            raise KdiError("диск %c не подключен" % dl)
+                        wfile = drv.open_write(raw_name)
+                    except KdiError as e:
+                        note("- создание не удалось: %s" % e)
+                    else:
+                        note("+ свободно блоков %d, входов каталога %d"
+                             % (len(drv.free_blocks()), len(drv.free_slots())))
 
                 elif fn == 23:
                     cr_flag = 0
+                    new_raw = bytes(pkt[0x14:0x1F])
                     print("\n + Переименование файла U%i: %c:%s -> %s"
-                          % (user, dl, disp, fmt_name(bytes(pkt[0x14:0x1F]))),
+                          % (user, dl, disp, fmt_name(new_raw)),
                           end="", flush=True)
+                    drv = sel_drive(drives, drive)
+                    try:
+                        if drv is None:
+                            raise KdiError("диск %c не подключен" % dl)
+                        n = drv.rename(raw_name, new_raw)
+                    except KdiError as e:
+                        note("- %s" % e)
+                    else:
+                        note("+ правок в каталоге: %d" % n)
 
                 elif fn == 36:
                     cr_flag = 0
@@ -287,8 +406,8 @@ def main():
     except KeyboardInterrupt:
         print("\n + Выход из монитора")
     finally:
-        if tempfile is not None:
-            tempfile.close()
+        if wfile is not None:
+            print("\n - Клиент не закрыл файл, образ не изменен")
         sysimage.close()
         for d in drives:
             if d is not None:
